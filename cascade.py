@@ -67,21 +67,15 @@ class Bucket:
     def include(self, item):
         related_exclusions = set()
         if len(self.includes) == 0:
-            #print("%d related items" % len(self.excludes))
             related_exclusions.update(self.excludes)
         self.includes.add(item)
-        #if len(related_exclusions) > 0:
-        #    print("%d" % len(related_exclusions))
         return related_exclusions
 
     def exclude(self, item):
         related_inclusions = set()
         if len(self.excludes) == 0:
-            #print("%d related items" % len(self.includes))
             related_inclusions.update(self.includes)
         self.excludes.add(item)
-        #if len(related_inclusions) > 0:
-        #    print("%d" % len(related_inclusions))
         return related_inclusions
 
     def get_true_negatives(self):
@@ -89,9 +83,14 @@ class Bucket:
             return self.excludes
         return []
 
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        return "includes: %s, excludes %s" % (self.includes, self.excludes)
+
 class CascadeLayer:
     def __init__(self, capacity, error_rate=0.1, depth=0):
-        print("Layer %d, capacity %d" % (depth, capacity))
         if not (0 < error_rate < 1):
             raise ValueError("Error_Rate must be between 0 and 1.")
         if not capacity > 0:
@@ -107,9 +106,7 @@ class CascadeLayer:
             (capacity * abs(math.log(error_rate))) /
             (num_slices * (math.log(2) ** 2))))
         self._setup(error_rate, num_slices, bits_per_slice, capacity)
-        print("making bucket array")
         self.buckets = [None for x in range(self.num_bits)]
-        print("made bucket array")
         self.exclusions = []
         self.childLayer = None
         self.depth = depth
@@ -163,35 +160,24 @@ class CascadeLayer:
         # loop over the elements that should be there. Add them to the filter.
         for elem in inclusions:
             possible_false_positives.update(self.record_for_layer(elem, True))
-            
-        possible_false_positives.update(self.get_layer_excludes())
 
-        print("%d possible false positives for this layer" % len(possible_false_positives))
+        possible_false_positives.update(exclusions)
 
         if propagate:
             false_positives = possible_false_positives.difference(self.get_layer_true_negatives())
-            print("%d false positives for this layer" % len(false_positives))
-            if len(false_positives) > 0:
+            if len(false_positives) > 0 or None != self.childLayer:
                 entries = set()
-                # for bucket in self.buckets:
-                #    if None != bucket:
-                #        entries.update(bucket.includes)
-                # TODO: MDG - how do entries and inclusions differ at this point?
                 entries.update(inclusions)
-                print("Propagating... we have %d false positives" % len(false_positives))
-                
-                print("Passing %d entries to the next layer" % len(entries))
                 if None == self.childLayer:
-                    print("Capacity is %d" % self.capacity)
                     self.childLayer = CascadeLayer(
                                 # TODO: MDG - the size of the child layer should be calculated in
                                 # a smarter way than this.
                                 len(false_positives),
+                                # 0.5, # <- suggested p for subsequent layers
                                 self.error_rate,
                                 self.depth + 1
                               )
                 self.childLayer.add_items(false_positives, entries, True)
-        # TODO: MDG - propagate current filter state to children
         # Propagation works like this:
         # Add the included entries, there will be new possible false positives
         # to check on account of the fact that some of these will hit buckets
@@ -202,9 +188,13 @@ class CascadeLayer:
         # as the *includes* and any new additions as the *excludes*.
 
     """Remove a batch of entries from the filter cascade."""
-    def remove_items(self, includes, excludes):
-        # TODO: MDG - Implement
-        pass
+    def remove_items(self, items):
+        for bucket in self.buckets:
+            if None != bucket:
+                bucket.includes.difference_update(items)
+                bucket.excludes.difference_update(items)
+        if None != self.childLayer:
+            self.childLayer.remove_items(items)
 
     def __contains__(self, elem):
         if self.filter_contains(elem):
@@ -217,7 +207,7 @@ class CascadeLayer:
         """Tests a key's membership in this bloom filter.
         """
         bits_per_slice = self.bits_per_slice
-        hashes = self.make_hashes(self.salt + key)
+        hashes = self.make_layer_hashes(key)
         offset = 0
         for k in hashes:
             if len(self.buckets[offset + k].includes) == 0:
@@ -225,12 +215,17 @@ class CascadeLayer:
             offset += bits_per_slice
         return True
 
+    def make_layer_hashes(self, key):
+        if isinstance(key, str):
+            return self.make_hashes(self.salt + key)
+        return self.make_hashes(self.salt + str(key))
+
     """returns affected *excludes* for new include items, affected *includes* for
     new exclude items"""
     def record_for_layer(self, key, add):
         """Adds a record to this filter cascade."""
         bits_per_slice = self.bits_per_slice
-        hashes = self.make_hashes(self.salt + key)
+        hashes = self.make_layer_hashes(key)
         offset = 0
         affected_items = set()
         for k in hashes:
@@ -245,58 +240,13 @@ class CascadeLayer:
                 affected_items.update(bucket.exclude(key))
         return affected_items
 
-    def copy(self):
-        """Return a copy of this filter cascade.
-        """
-        new_cascade = CascadeLayer(self.capacity, self.error_rate, self.depth)
-        # MDG: TODO - copy children
-        return new_cascade
-
-    def check(self, entries, exclusions):
-        for entry in entries:
-            if entry not in self:
-                raise ValueError("oops! false negative!")
-        for entry in exclusions:
-            if entry in self:
-                raise ValueError("oops! false positive!")
-
-    def bitCount(self):
+    def bit_count(self):
         if self.childLayer is None:
             return len(self.make_layer_bit_array())
-        return len(self.make_layer_bit_array()) + self.childLayer.bitCount()
+        return len(self.make_layer_bit_array()) + self.childLayer.bit_count()
 
-    def layerCount(self):
+    def layer_count(self):
         if self.childLayer is None:
             return 1
         else:
-            return self.childLayer.layerCount() + 1
-    
-    def dump(self):
-        #print(self.make_layer_bit_array())
-        print("====")
-        if None != self.childLayer:
-            self.childLayer.dump()
-
-if __name__ == "__main__":
-    import doctest
-    doctest.testmod()
-    count = 10000 * 100
-    print("Prepare data")
-    valid, revoked = [],[]
-    for i in range(count):
-        if i % 4 == 1:
-            revoked.append("%d" % i)
-        else:
-            valid.append("%d" % i)
-    print("Initialize")
-
-    cascade = CascadeLayer(int(count / 4), 0.01)
-    
-    cascade.add_items(revoked[:100000], valid[:600000], True)
-    print(".")
-    cascade.add_items(revoked[100000:200000], valid[200000:600000], True)
-    print(".")
-    cascade.add_items(revoked[200000:], valid[600000:], True)
-    print("Check")
-    cascade.check(revoked, valid)
-    # cascade.dump()
+            return self.childLayer.layer_count() + 1
